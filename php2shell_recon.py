@@ -27,8 +27,10 @@ import concurrent.futures
 import csv
 import ipaddress
 import json
+import random
 import re
 import socket
+import string
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -37,7 +39,7 @@ from typing import Optional
 
 import requests
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 CRTSH_URL = "https://crt.sh/"
 INTERNETDB_URL = "https://internetdb.shodan.io/{ip}"
@@ -59,8 +61,20 @@ STATUS_PATCHED = "PATCHED"
 STATUS_UNKNOWN_BRANCH = "UNKNOWN_BRANCH"
 STATUS_NO_VERSION = "NO_VERSION"
 STATUS_NO_DATA = "NO_DATA"
+STATUS_PRIVATE_IP = "PRIVATE_IP"
 
 RISK_STATUSES = {STATUS_VULNERABLE_EOL, STATUS_VULNERABLE_UNPATCHED}
+
+# Retry/backoff tuning for crt.sh and InternetDB, both of which rate-limit
+# (HTTP 429) or occasionally 5xx under load.
+MAX_RETRIES = 3
+BACKOFF_BASE_SECONDS = 1.5
+
+# Shodan InternetDB's own 'tags' field, when it includes any of these,
+# means the IP is known cloud/CDN/edge infrastructure -- a strong signal
+# that whatever CPE/port data came back may describe the edge node, not
+# the real origin server behind it.
+CDN_TAGS = {"cdn", "cloud"}
 
 # ANSI colors (disabled automatically with --no-color or when not a TTY)
 class C:
@@ -91,6 +105,7 @@ class HostResult:
     status: str = STATUS_NO_DATA
     live_server_header: Optional[str] = None
     live_powered_by_header: Optional[str] = None
+    likely_cdn: bool = False
 
     def to_row(self) -> dict:
         return {
@@ -102,6 +117,7 @@ class HostResult:
             "other_vulns": ";".join(self.other_vulns),
             "php_version": self.php_version or "",
             "php2shell_status": self.status,
+            "likely_cdn": "yes" if self.likely_cdn else "",
             "live_server_header": self.live_server_header or "",
             "live_x_powered_by": self.live_powered_by_header or "",
         }
@@ -137,18 +153,62 @@ def extract_php_version(cpes: list) -> Optional[str]:
     return None
 
 
-def get_subdomains(domain: str, session: requests.Session, timeout: int) -> set:
-    """Enumerate subdomains for a domain via crt.sh certificate transparency logs."""
+def _request_with_retry(session: requests.Session, method: str, url: str,
+                         timeout: int, **kwargs) -> Optional[requests.Response]:
+    """
+    Shared retry/backoff wrapper. Retries on HTTP 429 (rate limited) and
+    5xx (transient server error), with exponential backoff. Both crt.sh
+    and InternetDB hit these under concurrent load often enough that a
+    silent single-attempt failure was undercounting real results.
+    Returns None if every attempt fails.
+    """
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = session.request(method, url, timeout=timeout, **kwargs)
+        except requests.RequestException as e:
+            last_exc = e
+            resp = None
+
+        if resp is not None:
+            if resp.status_code == 429 or resp.status_code >= 500:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    sleep_for = float(retry_after)
+                else:
+                    sleep_for = BACKOFF_BASE_SECONDS * (2 ** attempt) + random.uniform(0, 0.5)
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(sleep_for)
+                    continue
+                return None
+            return resp
+
+        # connection-level failure; back off and retry
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt) + random.uniform(0, 0.5))
+
+    return None
+
+
+def get_subdomains(domain: str, session: requests.Session, timeout: int) -> tuple:
+    """
+    Enumerate subdomains for a domain via crt.sh certificate transparency
+    logs. Returns (names: set, crtsh_failed: bool) -- the bool lets the
+    caller warn the user that a 0/low subdomain count may reflect a crt.sh
+    failure rather than the domain genuinely having few/no subdomains.
+    """
+    resp = _request_with_retry(
+        session, "GET", CRTSH_URL, timeout,
+        params={"q": f"%.{domain}", "output": "json"},
+    )
+
+    if resp is None:
+        return {domain}, True
+
     try:
-        resp = session.get(
-            CRTSH_URL,
-            params={"q": f"%.{domain}", "output": "json"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
         entries = resp.json()
-    except (requests.RequestException, json.JSONDecodeError, ValueError):
-        return {domain}
+    except (json.JSONDecodeError, ValueError):
+        return {domain}, True
 
     names = set()
     for entry in entries:
@@ -157,7 +217,7 @@ def get_subdomains(domain: str, session: requests.Session, timeout: int) -> set:
             if name:
                 names.add(name)
     names.add(domain)
-    return names
+    return names, False
 
 
 def resolve_host(hostname: str, timeout: int) -> Optional[str]:
@@ -171,16 +231,37 @@ def resolve_host(hostname: str, timeout: int) -> Optional[str]:
 
 def query_internetdb(ip: str, session: requests.Session, timeout: int) -> Optional[dict]:
     """Query Shodan's free InternetDB for a single IP. Returns None on miss/error."""
-    try:
-        resp = session.get(INTERNETDB_URL.format(ip=ip), timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if "detail" in data:
-            return None
-        return data
-    except (requests.RequestException, json.JSONDecodeError, ValueError):
+    resp = _request_with_retry(session, "GET", INTERNETDB_URL.format(ip=ip), timeout)
+    if resp is None or resp.status_code != 200:
         return None
+    try:
+        data = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if "detail" in data:
+        return None
+    return data
+
+
+def is_private_ip(ip: str) -> bool:
+    """True for RFC1918/loopback/link-local addresses -- not worth querying
+    InternetDB for, since Shodan never scans non-public address space."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_private or addr.is_loopback or addr.is_link_local
+
+
+def detect_wildcard_ip(domain: str, timeout: int) -> Optional[str]:
+    """
+    Resolve a random, almost-certainly-nonexistent subdomain under `domain`.
+    If it resolves anyway, the domain has wildcard DNS (or a catch-all),
+    and that IP is returned so callers can filter out subdomains that just
+    happen to share it -- those aren't necessarily real, distinct hosts.
+    """
+    nonce = "".join(random.choices(string.ascii_lowercase + string.digits, k=20))
+    return resolve_host(f"{nonce}.{domain}", timeout)
 
 
 def verify_live_headers(hostname: str, session: requests.Session, timeout: int) -> tuple:
@@ -223,11 +304,21 @@ def build_host_list(domains: list, no_subdomains: bool, session: requests.Sessio
         for fut in concurrent.futures.as_completed(futures):
             vendor = futures[fut]
             try:
-                subs = fut.result()
+                subs, crtsh_failed = fut.result()
             except Exception:
-                subs = {vendor}
-            if not quiet:
+                subs, crtsh_failed = {vendor}, True
+
+            if crtsh_failed and not quiet:
+                print(
+                    f"{C.YELLOW}    {vendor}: crt.sh lookup failed after "
+                    f"{MAX_RETRIES} attempts -- falling back to apex domain "
+                    f"only. Results for this vendor may be incomplete; "
+                    f"consider re-running later.{C.RESET}",
+                    file=sys.stderr,
+                )
+            elif not quiet:
                 print(f"{C.DIM}    {vendor}: {len(subs)} hosts{C.RESET}", file=sys.stderr)
+
             for s in subs:
                 pairs.append((vendor, s))
 
@@ -240,6 +331,39 @@ def run_recon(domains: list, no_subdomains: bool, concurrency: int, timeout: int
     session.headers.update({"User-Agent": f"php2shell-recon/{__version__}"})
 
     pairs = build_host_list(domains, no_subdomains, session, timeout, concurrency, quiet)
+
+    # --- Wildcard DNS detection ---------------------------------------
+    # A domain with wildcard DNS (or a catch-all record) makes crt.sh's
+    # subdomain list misleading: lots of "subdomains" that all resolve to
+    # one irrelevant IP (often a parking page or generic load balancer).
+    # Detect it per vendor domain, then drop non-apex subdomains that
+    # share that exact IP -- they're very unlikely to be distinct, real
+    # hosts worth a separate finding.
+    vendor_domains = sorted({v for v, _s in pairs})
+    wildcard_ip: dict = {}
+    if not no_subdomains and vendor_domains:
+        if not quiet:
+            print(f"{C.DIM}[*] Checking for wildcard DNS...{C.RESET}", file=sys.stderr)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(concurrency, len(vendor_domains))) as ex:
+            futures = {ex.submit(detect_wildcard_ip, v, timeout): v for v in vendor_domains}
+            for fut in concurrent.futures.as_completed(futures):
+                v = futures[fut]
+                try:
+                    ip = fut.result()
+                except Exception:
+                    ip = None
+                if ip:
+                    wildcard_ip[v] = ip
+
+        for v, ip in wildcard_ip.items():
+            if not quiet:
+                print(
+                    f"{C.YELLOW}    {v}: wildcard DNS detected (catch-all -> {ip}). "
+                    f"Subdomains resolving to this IP will be filtered as likely "
+                    f"non-distinct hosts.{C.RESET}",
+                    file=sys.stderr,
+                )
+
     unique_hosts = sorted({sub for _vendor, sub in pairs})
 
     if not quiet:
@@ -259,9 +383,28 @@ def run_recon(domains: list, no_subdomains: bool, concurrency: int, timeout: int
             except Exception:
                 host_ip[host] = None
 
-    unique_ips = sorted({ip for ip in host_ip.values() if ip})
+    # Apply wildcard filtering: drop non-apex pairs whose IP matches the
+    # vendor's detected wildcard IP. Always keep the apex domain itself.
+    if wildcard_ip:
+        filtered_pairs = []
+        for vendor, sub in pairs:
+            wip = wildcard_ip.get(vendor)
+            if wip and sub != vendor and host_ip.get(sub) == wip:
+                continue
+            filtered_pairs.append((vendor, sub))
+        pairs = filtered_pairs
+
+    all_ips = {ip for ip in host_ip.values() if ip}
+    private_ips = {ip for ip in all_ips if is_private_ip(ip)}
+    unique_ips = sorted(all_ips - private_ips)
 
     if not quiet:
+        if private_ips:
+            print(
+                f"{C.DIM}[*] Skipping {len(private_ips)} private/internal IP(s) "
+                f"(not scanned by Shodan).{C.RESET}",
+                file=sys.stderr,
+            )
         print(
             f"{C.DIM}[*] Querying InternetDB for {len(unique_ips)} unique IPs "
             f"(concurrency={concurrency})...{C.RESET}",
@@ -283,11 +426,18 @@ def run_recon(domains: list, no_subdomains: bool, concurrency: int, timeout: int
         ip = host_ip.get(sub)
         r = HostResult(vendor_domain=vendor, subdomain=sub, ip=ip)
 
+        if ip and ip in private_ips:
+            r.status = STATUS_PRIVATE_IP
+            results.append(r)
+            continue
+
         data = ip_data.get(ip) if ip else None
         if data:
             r.open_ports = data.get("ports", []) or []
             r.cpes = data.get("cpes", []) or []
             r.other_vulns = data.get("vulns", []) or []
+            tags = {t.lower() for t in (data.get("tags") or [])}
+            r.likely_cdn = bool(tags & CDN_TAGS)
             php_cpes = [c for c in r.cpes if "php" in c.lower()]
             if php_cpes:
                 r.php_version = extract_php_version(php_cpes)
@@ -295,13 +445,21 @@ def run_recon(domains: list, no_subdomains: bool, concurrency: int, timeout: int
 
         results.append(r)
 
-    # Only hosts InternetDB actually had port data for are "real" results;
-    # drop pure dead-air entries (no IP or no InternetDB record at all) from
-    # the interesting set, but keep them available if the caller wants them.
-    interesting = [r for r in results if r.ip and r.open_ports]
+    # Only hosts InternetDB actually had port data for, or that were
+    # explicitly classified as private-IP, are "real" results; drop pure
+    # dead-air entries (no IP or no InternetDB record at all).
+    interesting = [
+        r for r in results
+        if (r.ip and r.open_ports) or r.status == STATUS_PRIVATE_IP
+    ]
 
     if verify_headers:
-        risky = [r for r in interesting if r.status in RISK_STATUSES or r.status in (STATUS_UNKNOWN_BRANCH, STATUS_NO_VERSION)]
+        risky = [
+            r for r in interesting
+            if r.status in RISK_STATUSES
+            or r.status in (STATUS_UNKNOWN_BRANCH, STATUS_NO_VERSION)
+            or r.likely_cdn
+        ]
         if risky and not quiet:
             print(
                 f"{C.YELLOW}[*] --verify-headers: sending a live HEAD request to "
@@ -335,6 +493,7 @@ def status_marker(status: str, use_color: bool) -> str:
         STATUS_NO_VERSION: ("[  ]", C.DIM),
         STATUS_PATCHED: ("[ok]", C.GREEN),
         STATUS_NO_DATA: ("[  ]", C.DIM),
+        STATUS_PRIVATE_IP: ("[--]", C.DIM),
     }
     text, color = markers.get(status, ("[  ]", C.DIM))
     return colorize(text, color, use_color)
@@ -354,7 +513,8 @@ def print_terminal_report(results: list, use_color: bool, quiet: bool) -> None:
     for r in php_hosts:
         marker = status_marker(r.status, use_color)
         version_str = f"PHP {r.php_version}" if r.php_version else "PHP ?"
-        line = f"  {marker} {r.subdomain:<40} {r.ip or '':<16} {version_str:<14} {r.status}"
+        cdn_tag = colorize(" [cdn/edge]", C.YELLOW, use_color) if r.likely_cdn else ""
+        line = f"  {marker} {r.subdomain:<40} {r.ip or '':<16} {version_str:<14} {r.status}{cdn_tag}"
         print(line)
         if r.live_server_header or r.live_powered_by_header:
             live_bits = []
@@ -404,8 +564,9 @@ def write_txt(results: list, path: str) -> None:
         for r in results:
             if not (r.cpes and any("php" in c.lower() for c in r.cpes)):
                 continue
+            cdn_note = " | likely CDN/edge" if r.likely_cdn else ""
             f.write(f"{r.vendor_domain} | {r.subdomain} | {r.ip} | "
-                     f"PHP {r.php_version or '?'} | {r.status}\n")
+                     f"PHP {r.php_version or '?'} | {r.status}{cdn_note}\n")
             if r.live_server_header or r.live_powered_by_header:
                 f.write(f"    live: Server={r.live_server_header or '-'} "
                          f"X-Powered-By={r.live_powered_by_header or '-'}\n")
@@ -414,7 +575,7 @@ def write_txt(results: list, path: str) -> None:
 def write_csv(results: list, path: str) -> None:
     fieldnames = [
         "vendor_domain", "subdomain", "ip", "open_ports", "cpes",
-        "other_vulns", "php_version", "php2shell_status",
+        "other_vulns", "php_version", "php2shell_status", "likely_cdn",
         "live_server_header", "live_x_powered_by",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:

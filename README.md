@@ -1,5 +1,7 @@
 # php2shell-recon
 
+![CI](https://github.com/Revelution91/php2shell-recon/actions/workflows/ci.yml/badge.svg)
+
 Passive recon tool for identifying externally-visible PHP infrastructure
 potentially exposed to **php2shell** ([CVE-2026-109618](https://nvd.nist.gov/vuln/detail/CVE-2026-109618)
 / [CVE-2026-109619](https://nvd.nist.gov/vuln/detail/CVE-2026-109619)), a pair
@@ -21,6 +23,13 @@ without sending exploit traffic or actively attacking anything by default.
    table.
 5. Reports results to the terminal and, optionally, to a file (text, JSON,
    or CSV).
+
+Along the way it automatically: retries crt.sh/InternetDB requests with
+backoff on rate limits (HTTP 429) and transient errors; detects wildcard DNS
+per domain and filters out non-distinct subdomains that just share the
+catch-all IP; skips private/internal IPs (never scanned by Shodan); and
+flags hosts InternetDB tags as CDN/cloud infrastructure, since those results
+are the most likely to describe an edge node rather than the real origin.
 
 ## Passive vs. active
 
@@ -143,6 +152,7 @@ python3 php2shell_recon.py --help
 | `other_vulns` | Any CVEs Shodan has already correlated to this host (unrelated to php2shell unless it happens to be listed) |
 | `php_version` | PHP version extracted from the CPE data, if present |
 | `php2shell_status` | See table below |
+| `likely_cdn` | `yes` if Shodan InternetDB tagged this IP as CDN/cloud infrastructure — a signal the data may describe an edge node, not the real origin |
 | `live_server_header` / `live_x_powered_by` | Only populated with `--verify-headers` |
 
 ## `php2shell_status` values
@@ -154,6 +164,7 @@ python3 php2shell_recon.py --help
 | `PATCHED` | PHP version detected, at or above the patched version |
 | `UNKNOWN_BRANCH` | A PHP version was detected on a branch not yet mapped in this tool (e.g. a future release) — verify manually |
 | `NO_VERSION` | PHP appears present (via CPE data) but no parseable version string was found |
+| `PRIVATE_IP` | Host resolved to an RFC1918/loopback/link-local address — not scanned by Shodan, not checked |
 
 Patched versions per branch, per the official advisory:
 
@@ -172,20 +183,29 @@ Patched versions per branch, per the official advisory:
 - **CDN/edge-fronted hosts give unreliable passive results.** If a target
   sits behind Cloudflare, Fastly, Varnish, an AWS load balancer, or a managed
   host like Acquia/Pantheon, InternetDB is often fingerprinting the edge
-  layer, not the real origin server. A `VULNERABLE_*` or `PATCHED` result for
-  such a host should be treated as unconfirmed until checked another way
-  (e.g. `--verify-headers`, or asking the vendor directly).
+  layer, not the real origin server. The tool flags this automatically when
+  Shodan's own data tags the IP as CDN/cloud infrastructure (`likely_cdn:
+  yes`), but the absence of that tag isn't a guarantee either — treat any
+  `VULNERABLE_*` or `PATCHED` result on a CDN-flagged or otherwise unclear
+  host as unconfirmed until checked another way (e.g. `--verify-headers`, or
+  asking the vendor directly).
 - **A blank/`NO_VERSION` result does not mean a host is safe** — many
   production servers deliberately strip version headers. Treat gaps as
   unknown, not clear.
 - **This tool only checks IPv4 `A` records.** IPv6-only hosts are not
   currently resolved.
+- **Wildcard DNS is detected and filtered**, but only at the "does a random
+  nonexistent subdomain resolve" level. A domain with partial/conditional
+  wildcarding could still slip through.
 - **`other_vulns` is independent of `php2shell_status`.** Since these CVEs
   were disclosed very recently, Shodan's own CVE correlation for them will
   likely lag; `php2shell_status` is computed directly from the detected PHP
   version specifically so it isn't blocked on that lag. The `other_vulns`
   field is just whatever else Shodan has already tagged for that host, shown
   for reference.
+- **Private/internal IPs are skipped** (not queried against InternetDB,
+  since Shodan never scans non-public address space) and reported with
+  status `PRIVATE_IP` instead.
 
 ## Disclaimer
 
