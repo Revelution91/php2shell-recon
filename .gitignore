@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Tool output (don't accidentally commit a vendor scan result)
+*.csv
+*.json
+!example_domains.txt
+output*/
+recon_output*/
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp

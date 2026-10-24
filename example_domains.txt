@@ -1,0 +1,6 @@
+# One apex domain per line. No http://, no www., no trailing slash.
+# Lines starting with # are ignored.
+#
+# example1.com
+# example2.org
+# example3.io
