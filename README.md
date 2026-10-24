@@ -62,7 +62,7 @@ substitute for an authorized penetration test.
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/php2shell-recon.git
+git clone https://github.com/Revelution91/php2shell-recon.git
 cd php2shell-recon
 pip install -r requirements.txt
 ```
