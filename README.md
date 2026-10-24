@@ -64,10 +64,23 @@ substitute for an authorized penetration test.
 ```bash
 git clone https://github.com/Revelution91/php2shell-recon.git
 cd php2shell-recon
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
-
 Requires Python 3.8+.
+
+** Note for Kali/Debian/Ubuntu 23.04+ users:**
+if 'pip install' fails with 'error: externally-managed environment',
+that's expected - these distros block system-wide pip installs by default.
+The venv steps above avoid this entirely. If you'd rather skip the venv, you 
+can for it with 'pip install -r requirements.txt --break-system-packages', 
+but a venv is recommended to avoid conflicts with your system's apt-managed 
+Python Packages.
+
+You'll need to run 'source venv/bin/activate' again each time you open a new
+terminal session to work on this project - it doesn't persist automatically.
+Run 'deactivate' to leave the venv when you're done.
 
 ## Usage
 
