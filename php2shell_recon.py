@@ -374,7 +374,7 @@ def print_terminal_report(results: list, use_color: bool, quiet: bool) -> None:
 
     print()
     print(colorize("-" * 70, C.CYAN, use_color))
-    print(f"  Vulnerable (patch available, not applied): {colorize(str(unpatched), C.RED, use_color)}")
+    print(f"  Vulnerable (patch available, not applied):  {colorize(str(unpatched), C.RED, use_color)}")
     print(f"  Vulnerable (EOL branch, no patch exists):   {colorize(str(eol), C.RED, use_color)}")
     print(f"  PHP detected, branch unmapped:              {colorize(str(unknown), C.YELLOW, use_color)}")
     print(f"  PHP detected, version unavailable:          {no_version}")
