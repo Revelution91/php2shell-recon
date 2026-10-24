@@ -5,7 +5,7 @@ Thanks for taking a look at this. PRs and issues are welcome.
 ## Setup
 
 ```bash
-git clone https://github.com/<your-username>/php2shell-recon.git
+git clone https://github.com/Revelution91/php2shell-recon.git
 cd php2shell-recon
 pip install -r requirements.txt -r requirements-dev.txt
 ```
