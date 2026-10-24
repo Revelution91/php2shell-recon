@@ -70,7 +70,7 @@ pip install -r requirements.txt
 ```
 Requires Python 3.8+.
 
-** Note for Kali/Debian/Ubuntu 23.04+ users:**
+**Note for Kali/Debian/Ubuntu 23.04+ users:**
 if 'pip install' fails with 'error: externally-managed environment',
 that's expected - these distros block system-wide pip installs by default.
 The venv steps above avoid this entirely. If you'd rather skip the venv, you 
