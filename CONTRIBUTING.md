@@ -7,8 +7,15 @@ Thanks for taking a look at this. PRs and issues are welcome.
 ```bash
 git clone https://github.com/Revelution91/php2shell-recon.git
 cd php2shell-recon
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 ```
+
+On Kali/Debian/Ubuntu 23.04+, 'pip install' without a venv will fail
+with 'externally-managed-environment' - see the README's Installation
+section for details. Remember to 'source venv/bin/activate' again in
+any new terminal session.
 
 ## Running tests
 
