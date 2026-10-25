@@ -8,8 +8,9 @@ potentially exposed to php2shell (CVE-2026-109618 / CVE-2026-109619).
 
 Data sources used (all passive, third-party, no packets sent to targets
 by default):
-  - crt.sh              certificate transparency log search (subdomain enum)
-  - internetdb.shodan.io free, keyless Shodan InternetDB endpoint (banner/CPE data)
+  - crt.sh                 certificate transparency log search (subdomain enum)
+  - api.certspotter.com    fallback CT log source if crt.sh is unavailable
+  - internetdb.shodan.io   free, keyless Shodan InternetDB endpoint (banner/CPE data)
 
 An opt-in --verify-headers flag will send a single HTTP HEAD request per
 flagged host directly to that host, to confirm/refute InternetDB's
@@ -39,9 +40,10 @@ from typing import Optional
 
 import requests
 
-__version__ = "1.1.0"
+__version__ = "1.3.1"
 
 CRTSH_URL = "https://crt.sh/"
+CERTSPOTTER_URL = "https://api.certspotter.com/v1/issuances"
 INTERNETDB_URL = "https://internetdb.shodan.io/{ip}"
 
 # php2shell (CVE-2026-109618 / CVE-2026-109619) patched versions, per branch.
@@ -54,6 +56,9 @@ PATCHED_VERSIONS = {
 }
 
 CPE_PHP_RE = re.compile(r"cpe:/a:php:php:(\d+)\.(\d+)\.(\d+)")
+# Matches "PHP/8.2.35", "php/8.2.35-1+ubuntu...", etc. -- the trailing
+# distro/build suffix (if any) is ignored, only the dotted version is kept.
+POWERED_BY_PHP_RE = re.compile(r"php/(\d+)\.(\d+)\.(\d+)", re.IGNORECASE)
 
 STATUS_VULNERABLE_EOL = "VULNERABLE_EOL"
 STATUS_VULNERABLE_UNPATCHED = "VULNERABLE_UNPATCHED"
@@ -106,6 +111,8 @@ class HostResult:
     live_server_header: Optional[str] = None
     live_powered_by_header: Optional[str] = None
     likely_cdn: bool = False
+    live_php_version: Optional[str] = None
+    live_status: Optional[str] = None
 
     def to_row(self) -> dict:
         return {
@@ -120,6 +127,8 @@ class HostResult:
             "likely_cdn": "yes" if self.likely_cdn else "",
             "live_server_header": self.live_server_header or "",
             "live_x_powered_by": self.live_powered_by_header or "",
+            "live_php_version": self.live_php_version or "",
+            "live_php2shell_status": self.live_status or "",
         }
 
 
@@ -151,6 +160,19 @@ def extract_php_version(cpes: list) -> Optional[str]:
         if m:
             return ".".join(m.groups())
     return None
+
+
+def extract_php_version_from_header(powered_by: Optional[str]) -> Optional[str]:
+    """Pull a dotted PHP version out of a live X-Powered-By header value,
+    e.g. 'PHP/8.2.35' -> '8.2.35'. Returns None if no PHP version is present
+    (some servers' X-Powered-By names something else entirely, or strips
+    the version, e.g. just 'PHP')."""
+    if not powered_by:
+        return None
+    m = POWERED_BY_PHP_RE.search(powered_by)
+    if not m:
+        return None
+    return ".".join(m.groups())
 
 
 def _request_with_retry(session: requests.Session, method: str, url: str,
@@ -190,25 +212,19 @@ def _request_with_retry(session: requests.Session, method: str, url: str,
     return None
 
 
-def get_subdomains(domain: str, session: requests.Session, timeout: int) -> tuple:
-    """
-    Enumerate subdomains for a domain via crt.sh certificate transparency
-    logs. Returns (names: set, crtsh_failed: bool) -- the bool lets the
-    caller warn the user that a 0/low subdomain count may reflect a crt.sh
-    failure rather than the domain genuinely having few/no subdomains.
-    """
+def _query_crtsh(domain: str, session: requests.Session, timeout: int) -> Optional[set]:
+    """Query crt.sh certificate transparency logs. Returns None on failure."""
     resp = _request_with_retry(
         session, "GET", CRTSH_URL, timeout,
         params={"q": f"%.{domain}", "output": "json"},
     )
-
     if resp is None:
-        return {domain}, True
+        return None
 
     try:
         entries = resp.json()
     except (json.JSONDecodeError, ValueError):
-        return {domain}, True
+        return None
 
     names = set()
     for entry in entries:
@@ -216,8 +232,67 @@ def get_subdomains(domain: str, session: requests.Session, timeout: int) -> tupl
             name = name.strip().lower().lstrip("*.")
             if name:
                 names.add(name)
-    names.add(domain)
-    return names, False
+    return names
+
+
+def _query_certspotter(domain: str, session: requests.Session, timeout: int) -> Optional[set]:
+    """
+    Query Cert Spotter's free (unauthenticated) issuances endpoint as a
+    fallback when crt.sh is unavailable. Same underlying concept (reads
+    public certificate transparency logs) but a different backend, so it
+    has a different, independent failure mode -- crt.sh tends to fail
+    under load (503/timeout), Cert Spotter's free tier tends to fail via
+    rate limiting (429) instead. Returns None on failure.
+    """
+    resp = _request_with_retry(
+        session, "GET", CERTSPOTTER_URL, timeout,
+        params={"domain": domain, "include_subdomains": "true", "expand": "dns_names"},
+    )
+    if resp is None:
+        return None
+
+    try:
+        entries = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not isinstance(entries, list):
+        # Cert Spotter returns a JSON object with an "error" key on failure
+        # (e.g. rate limited) rather than a list of issuances.
+        return None
+
+    names = set()
+    for entry in entries:
+        for name in entry.get("dns_names", []) or []:
+            name = str(name).strip().lower().lstrip("*.")
+            if name:
+                names.add(name)
+    return names
+
+
+def get_subdomains(domain: str, session: requests.Session, timeout: int) -> tuple:
+    """
+    Enumerate subdomains for a domain via certificate transparency logs.
+    Tries crt.sh first; if that fails (after its own internal retries),
+    falls back to Cert Spotter before giving up entirely.
+
+    Returns (names: set, source: str, fully_failed: bool):
+      - source is "crt.sh", "certspotter", or "none"
+      - fully_failed is True only if BOTH sources failed, so the caller
+        knows a low/zero subdomain count may reflect an outage on both
+        services rather than the domain genuinely having few subdomains.
+    """
+    names = _query_crtsh(domain, session, timeout)
+    if names is not None:
+        names.add(domain)
+        return names, "crt.sh", False
+
+    names = _query_certspotter(domain, session, timeout)
+    if names is not None:
+        names.add(domain)
+        return names, "certspotter", False
+
+    return {domain}, "none", True
 
 
 def resolve_host(hostname: str, timeout: int) -> Optional[str]:
@@ -304,16 +379,22 @@ def build_host_list(domains: list, no_subdomains: bool, session: requests.Sessio
         for fut in concurrent.futures.as_completed(futures):
             vendor = futures[fut]
             try:
-                subs, crtsh_failed = fut.result()
+                subs, source, fully_failed = fut.result()
             except Exception:
-                subs, crtsh_failed = {vendor}, True
+                subs, source, fully_failed = {vendor}, "none", True
 
-            if crtsh_failed and not quiet:
+            if fully_failed and not quiet:
                 print(
-                    f"{C.YELLOW}    {vendor}: crt.sh lookup failed after "
-                    f"{MAX_RETRIES} attempts -- falling back to apex domain "
-                    f"only. Results for this vendor may be incomplete; "
-                    f"consider re-running later.{C.RESET}",
+                    f"{C.YELLOW}    {vendor}: both crt.sh and Cert Spotter "
+                    f"lookups failed -- falling back to apex domain only. "
+                    f"Results for this vendor may be incomplete; consider "
+                    f"re-running later.{C.RESET}",
+                    file=sys.stderr,
+                )
+            elif source == "certspotter" and not quiet:
+                print(
+                    f"{C.YELLOW}    {vendor}: {len(subs)} hosts "
+                    f"(crt.sh was unavailable, used Cert Spotter fallback){C.RESET}",
                     file=sys.stderr,
                 )
             elif not quiet:
@@ -475,6 +556,9 @@ def run_recon(domains: list, no_subdomains: bool, concurrency: int, timeout: int
                     server, powered_by = fut.result()
                     r.live_server_header = server
                     r.live_powered_by_header = powered_by
+                    r.live_php_version = extract_php_version_from_header(powered_by)
+                    if r.live_php_version:
+                        r.live_status = classify_php2shell(r.live_php_version)
                 except Exception:
                     pass
 
@@ -499,6 +583,62 @@ def status_marker(status: str, use_color: bool) -> str:
     return colorize(text, color, use_color)
 
 
+def reconciliation_note(passive_status: str, live_status: Optional[str],
+                         live_version: Optional[str]) -> Optional[tuple]:
+    """
+    Compare the passive (InternetDB-derived) status against the live
+    (--verify-headers-derived) status and return (text, color) describing
+    what the live check actually tells us, or None if there's nothing
+    meaningful to report (e.g. no live version was recoverable at all).
+    """
+    if not live_status:
+        if live_status is None and live_version is None:
+            return (
+                "live check -> no PHP version visible in live headers "
+                "(stripped or hidden); cannot confirm patch status this way.",
+                C.DIM,
+            )
+        return None
+
+    was_risky = passive_status in RISK_STATUSES
+    is_risky = live_status in RISK_STATUSES
+
+    if was_risky and live_status == STATUS_PATCHED:
+        return (
+            f"-> live check: PHP {live_version} is PATCHED. Passive data "
+            f"was stale or reflected a different layer (e.g. a CDN/edge "
+            f"node) -- this host does not appear vulnerable.",
+            C.GREEN,
+        )
+    if was_risky and is_risky:
+        return (
+            f"-> live check CONFIRMS: PHP {live_version} is still "
+            f"vulnerable to php2shell (CVE-2026-109618 / CVE-2026-109619).",
+            C.RED,
+        )
+    if not was_risky and is_risky:
+        return (
+            f"-> live check: PHP {live_version} is actually VULNERABLE. "
+            f"Passive data missed this -- treat as a real finding.",
+            C.RED,
+        )
+    if live_status == STATUS_PATCHED:
+        return (f"-> live check confirms PHP {live_version} is patched.", C.GREEN)
+
+    return None
+
+
+def effective_status(r: "HostResult") -> str:
+    """
+    The status that should actually be trusted and counted: the live,
+    --verify-headers-derived status if one was obtained, otherwise the
+    passive (InternetDB) status. This is what drives both the per-host
+    marker/display and the summary counts, so a host confirmed patched
+    via live check is no longer shown or counted as vulnerable.
+    """
+    return r.live_status if r.live_status else r.status
+
+
 def print_terminal_report(results: list, use_color: bool, quiet: bool) -> None:
     php_hosts = [r for r in results if r.php_version or r.status not in (STATUS_NO_DATA,)]
     php_hosts = [r for r in results if r.cpes and any("php" in c.lower() for c in r.cpes)]
@@ -511,11 +651,18 @@ def print_terminal_report(results: list, use_color: bool, quiet: bool) -> None:
         print()
 
     for r in php_hosts:
-        marker = status_marker(r.status, use_color)
-        version_str = f"PHP {r.php_version}" if r.php_version else "PHP ?"
+        eff_status = effective_status(r)
+        marker = status_marker(eff_status, use_color)
+        # Prefer the live-verified version/string once we have one -- the
+        # top line should reflect what's actually true, not stale passive
+        # data sitting next to a note that contradicts it.
+        display_version = r.live_php_version or r.php_version
+        version_str = f"PHP {display_version}" if display_version else "PHP ?"
         cdn_tag = colorize(" [cdn/edge]", C.YELLOW, use_color) if r.likely_cdn else ""
-        line = f"  {marker} {r.subdomain:<40} {r.ip or '':<16} {version_str:<14} {r.status}{cdn_tag}"
+        verified_tag = colorize(" (live-verified)", C.CYAN, use_color) if r.live_status else ""
+        line = f"  {marker} {r.subdomain:<40} {r.ip or '':<16} {version_str:<14} {eff_status}{verified_tag}{cdn_tag}"
         print(line)
+
         if r.live_server_header or r.live_powered_by_header:
             live_bits = []
             if r.live_server_header:
@@ -524,13 +671,31 @@ def print_terminal_report(results: list, use_color: bool, quiet: bool) -> None:
                 live_bits.append(f"X-Powered-By: {r.live_powered_by_header}")
             print(colorize(f"         live check -> {', '.join(live_bits)}", C.CYAN, use_color))
 
+            # Only show the passive-vs-live reconciliation explanation when
+            # the live result actually changed the picture -- if nothing
+            # changed, the marker/status above already says it all and a
+            # repeated "confirms" note is just noise.
+            if r.live_status and r.live_status != r.status:
+                note = reconciliation_note(r.status, r.live_status, r.live_php_version)
+                if note:
+                    text, color = note
+                    print(colorize(f"         {text}", color, use_color))
+
     if quiet:
         return
 
-    eol = sum(1 for r in results if r.status == STATUS_VULNERABLE_EOL)
-    unpatched = sum(1 for r in results if r.status == STATUS_VULNERABLE_UNPATCHED)
-    unknown = sum(1 for r in results if r.status == STATUS_UNKNOWN_BRANCH)
-    no_version = sum(1 for r in results if r.status == STATUS_NO_VERSION and any("php" in c.lower() for c in r.cpes))
+    eol = sum(1 for r in results if effective_status(r) == STATUS_VULNERABLE_EOL)
+    unpatched = sum(1 for r in results if effective_status(r) == STATUS_VULNERABLE_UNPATCHED)
+    unknown = sum(1 for r in results if effective_status(r) == STATUS_UNKNOWN_BRANCH)
+    no_version = sum(
+        1 for r in results
+        if effective_status(r) == STATUS_NO_VERSION and any("php" in c.lower() for c in r.cpes)
+    )
+    live_corrected = sum(
+        1 for r in results
+        if r.live_status and r.live_status != r.status
+        and r.status in RISK_STATUSES and r.live_status == STATUS_PATCHED
+    )
 
     print()
     print(colorize("-" * 70, C.CYAN, use_color))
@@ -538,6 +703,11 @@ def print_terminal_report(results: list, use_color: bool, quiet: bool) -> None:
     print(f"  Vulnerable (EOL branch, no patch exists):   {colorize(str(eol), C.RED, use_color)}")
     print(f"  PHP detected, branch unmapped:              {colorize(str(unknown), C.YELLOW, use_color)}")
     print(f"  PHP detected, version unavailable:          {no_version}")
+    if live_corrected:
+        print(
+            f"  Cleared by --verify-headers (passive flag was stale/wrong): "
+            f"{colorize(str(live_corrected), C.GREEN, use_color)}"
+        )
     print(colorize("-" * 70, C.CYAN, use_color))
     print()
     print(colorize(
@@ -570,6 +740,9 @@ def write_txt(results: list, path: str) -> None:
             if r.live_server_header or r.live_powered_by_header:
                 f.write(f"    live: Server={r.live_server_header or '-'} "
                          f"X-Powered-By={r.live_powered_by_header or '-'}\n")
+                note = reconciliation_note(r.status, r.live_status, r.live_php_version)
+                if note:
+                    f.write(f"    {note[0]}\n")
 
 
 def write_csv(results: list, path: str) -> None:
@@ -577,6 +750,7 @@ def write_csv(results: list, path: str) -> None:
         "vendor_domain", "subdomain", "ip", "open_ports", "cpes",
         "other_vulns", "php_version", "php2shell_status", "likely_cdn",
         "live_server_header", "live_x_powered_by",
+        "live_php_version", "live_php2shell_status",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

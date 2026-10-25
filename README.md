@@ -14,7 +14,9 @@ without sending exploit traffic or actively attacking anything by default.
 ## What it does
 
 1. Enumerates subdomains for each target domain via [crt.sh](https://crt.sh)
-   certificate transparency logs (passive, no interaction with the target).
+   certificate transparency logs (passive, no interaction with the target),
+   automatically falling back to [Cert Spotter](https://sslmate.com/certspotter/)
+   if crt.sh is unavailable.
 2. Resolves every discovered host to an IP.
 3. Checks each unique IP against Shodan's free, keyless
    [InternetDB](https://internetdb.shodan.io) endpoint for open ports and
@@ -24,19 +26,21 @@ without sending exploit traffic or actively attacking anything by default.
 5. Reports results to the terminal and, optionally, to a file (text, JSON,
    or CSV).
 
-Along the way it automatically: retries crt.sh/InternetDB requests with
-backoff on rate limits (HTTP 429) and transient errors; detects wildcard DNS
-per domain and filters out non-distinct subdomains that just share the
-catch-all IP; skips private/internal IPs (never scanned by Shodan); and
-flags hosts InternetDB tags as CDN/cloud infrastructure, since those results
-are the most likely to describe an edge node rather than the real origin.
+Along the way it automatically: retries crt.sh/Cert Spotter/InternetDB
+requests with backoff on rate limits (HTTP 429) and transient errors; falls
+back from crt.sh to Cert Spotter if crt.sh is down or erroring; detects
+wildcard DNS per domain and filters out non-distinct subdomains that just
+share the catch-all IP; skips private/internal IPs (never scanned by
+Shodan); and flags hosts InternetDB tags as CDN/cloud infrastructure, since
+those results are the most likely to describe an edge node rather than the
+real origin.
 
 ## Passive vs. active
 
 By default, **nothing in this tool sends traffic directly to a scanned
-target.** All data comes from crt.sh and Shodan InternetDB, both third-party
-services that have already done the scanning independently of you running
-this tool.
+target.** All data comes from crt.sh, Cert Spotter (fallback), and Shodan
+InternetDB, all third-party services that have already done the scanning
+independently of you running this tool.
 
 The one exception is the opt-in `--verify-headers` flag, which sends a single
 HTTP `HEAD` request per flagged host directly to that host, to confirm or
@@ -68,19 +72,20 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+
 Requires Python 3.8+.
 
-**Note for Kali/Debian/Ubuntu 23.04+ users:**
-if 'pip install' fails with 'error: externally-managed environment',
-that's expected - these distros block system-wide pip installs by default.
-The venv steps above avoid this entirely. If you'd rather skip the venv, you 
-can for it with 'pip install -r requirements.txt --break-system-packages', 
-but a venv is recommended to avoid conflicts with your system's apt-managed 
-Python Packages.
+**Note for Kali / Debian / Ubuntu 23.04+ users:** if `pip install` fails
+with `error: externally-managed-environment`, that's expected — these
+distros block system-wide pip installs by default (PEP 668). The venv
+steps above avoid this entirely. If you'd rather skip the venv, you can
+force it with `pip install -r requirements.txt --break-system-packages`,
+but a venv is recommended to avoid conflicts with your system's
+apt-managed Python packages.
 
-You'll need to run 'source venv/bin/activate' again each time you open a new
-terminal session to work on this project - it doesn't persist automatically.
-Run 'deactivate' to leave the venv when you're done.
+You'll need to run `source venv/bin/activate` again each time you open a
+new terminal session to work on this project — it doesn't persist
+automatically. Run `deactivate` to leave the venv when you're done.
 
 ## Usage
 
@@ -138,6 +143,47 @@ terminal only.
 python3 php2shell_recon.py -d yourowndomain.com --verify-headers
 ```
 
+`--verify-headers` doesn't just display the live `Server`/`X-Powered-By`
+headers — it **re-classifies against them** and tells you plainly whether
+the live-detected PHP version is actually patched, independent of whatever
+the passive (InternetDB) data said. This is the direct fix for the most
+common false positive this tool produces: a CDN/edge-fronted host where
+InternetDB's cached data is stale or describes the wrong layer.
+
+The per-host marker, version, and status shown always reflect the
+**effective status** — the live-verified result when one was obtained,
+falling back to the passive result otherwise. A host corrected from
+vulnerable to patched is shown with a green `[ok]` marker, a
+`(live-verified)` tag, and a one-line explanation, and — importantly — it
+is no longer counted in the "Vulnerable" totals in the summary block. The
+summary also reports how many hosts were cleared this way:
+
+```
+  [ok] origin.example.com                       1.2.3.4          PHP 8.2.35     PATCHED (live-verified)
+         live check -> Server: Apache, X-Powered-By: PHP/8.2.35
+         -> live check: PHP 8.2.35 is PATCHED. Passive data was stale or
+            reflected a different layer (e.g. a CDN/edge node) -- this
+            host does not appear vulnerable.
+
+  Vulnerable (patch available, not applied): 0
+  Cleared by --verify-headers (passive flag was stale/wrong): 1
+```
+
+If the live check instead *confirms* the passive result (still vulnerable,
+or still patched), the marker/status don't change, so no redundant
+"confirms" sentence is printed — the `(live-verified)` tag alone tells you
+it was actively checked rather than just assumed:
+
+```
+  [!!] legacy.example.com                       5.6.7.8          PHP 8.1.5      VULNERABLE_EOL (live-verified)
+         live check -> Server: Apache, X-Powered-By: PHP/8.1.5
+```
+
+If no PHP version is recoverable from the live headers at all (stripped
+`X-Powered-By`, or the site doesn't expose one), the tool says so
+explicitly rather than staying silent or leaving the passive flag
+unexplained.
+
 ### Tuning concurrency / timeouts
 
 ```bash
@@ -166,7 +212,9 @@ python3 php2shell_recon.py --help
 | `php_version` | PHP version extracted from the CPE data, if present |
 | `php2shell_status` | See table below |
 | `likely_cdn` | `yes` if Shodan InternetDB tagged this IP as CDN/cloud infrastructure — a signal the data may describe an edge node, not the real origin |
-| `live_server_header` / `live_x_powered_by` | Only populated with `--verify-headers` |
+| `live_server_header` / `live_x_powered_by` | Raw headers from the live HEAD request, only populated with `--verify-headers` |
+| `live_php_version` | PHP version parsed from the live `X-Powered-By` header, if present |
+| `live_php2shell_status` | `php2shell_status` re-computed from `live_php_version` — this is the one to trust over the passive `php2shell_status` when both are present |
 
 ## `php2shell_status` values
 

@@ -12,10 +12,10 @@ source venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 ```
 
-On Kali/Debian/Ubuntu 23.04+, 'pip install' without a venv will fail
-with 'externally-managed-environment' - see the README's Installation
-section for details. Remember to 'source venv/bin/activate' again in
-any new terminal session.
+On Kali/Debian/Ubuntu 23.04+, `pip install` without a venv will fail with
+`externally-managed-environment` — see the README's Installation section
+for details. Remember to `source venv/bin/activate` again in any new
+terminal session.
 
 ## Running tests
 
@@ -25,7 +25,7 @@ pytest tests/ -v
 
 Tests cover pure logic (version classification, CPE parsing, retry/backoff
 behavior with a mocked session, private-IP detection) and don't hit the
-real network — no live crt.sh/InternetDB calls happen in CI.
+real network — no live crt.sh/Cert Spotter/InternetDB calls happen in CI.
 
 If you add a new function with any non-trivial branching (especially
 anything touching the `php2shell_status` classification), please add a
