@@ -15,9 +15,14 @@ env/
 # Tool output (don't accidentally commit a vendor scan result)
 *.csv
 *.json
-!example_domains.txt
 output*/
 recon_output*/
+
+# Personal/vendor domain lists -- never commit real target lists.
+# The tracked example_domains.txt template is explicitly re-included below.
+*.txt
+!requirements*.txt
+!example_domains.txt
 
 # OS / editor cruft
 .DS_Store
